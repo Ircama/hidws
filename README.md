@@ -96,11 +96,18 @@ All messages are JSON over WebSocket.
 | Type | Payload |
 |------|---------|
 | `device_list` | `{"type":"device_list","devices":[{"vendorId":...,"productId":...,"productName":"..."}]}` |
-| `opened` | `{"type":"opened","vendorId":...,"productId":...,"productName":"..."}` |
+| `opened` | `{"type":"opened","vendorId":...,"productId":...,"productName":"...","usagePage":...,"usage":...,"interfaceNumber":...,"busType":...,"releaseNumber":...,"serialNumber":"...","reportDescriptor":[...]}` |
 | `input_report` | `{"type":"input_report","reportId":<int>,"data":[<bytes>]}` |
 | `ok` | `{"type":"ok"}` |
 | `error` | `{"type":"error","message":"..."}` |
 | `closed` | `{"type":"closed"}` |
+
+> `opened` (v1.2.0+) also carries the hidapi device info (`usagePage`, `usage`,
+> `interfaceNumber`, `busType`, `releaseNumber`, `serialNumber`) and the raw
+> HID report descriptor as a byte array (`reportDescriptor`), so clients can
+> render the same report collections (input/output/feature with report IDs and
+> items) as a local WebHID connection. Older clients simply ignore the extra
+> fields.
 
 ## Notes
 

@@ -1,5 +1,5 @@
 /*
- * hidws v1.1.0 — WebSocket ↔ HID bridge
+ * hidws v1.2.0 — WebSocket ↔ HID bridge
  *
  * Uses libwebsockets for WebSocket server, hidapi (libusb) for HID access.
  *
@@ -37,7 +37,7 @@
 #include <libwebsockets.h>
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.1.0"
+#define HIDWS_VERSION "1.2.0"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -221,13 +221,59 @@ static void cmd_open(struct lws *wsi, int vendor_id, int product_id) {
         }
     }
 
+    /* Gather extra device info from enumeration (usage, interface, bus, ...) */
+    unsigned short usage_page = 0, usage = 0, release_number = 0;
+    int interface_number = -1, bus_type = -1;
+    char serial_str[128] = "";
+    struct hid_device_info *devs = hid_enumerate(0, 0);
+    for (struct hid_device_info *cur = devs; cur; cur = cur->next) {
+        if (cur->vendor_id == (unsigned short)vendor_id &&
+            cur->product_id == (unsigned short)product_id) {
+            usage_page = cur->usage_page;
+            usage = cur->usage;
+            interface_number = cur->interface_number;
+            bus_type = cur->bus_type;
+            release_number = cur->release_number;
+            if (cur->serial_number) {
+                size_t n = wcstombs(serial_str, cur->serial_number, sizeof(serial_str) - 1);
+                if (n == (size_t)-1) serial_str[0] = '\0';
+            }
+            break;
+        }
+    }
+    if (devs) hid_free_enumeration(devs);
+
+    /* Fetch the raw HID report descriptor so clients can render collections */
+    unsigned char rdesc[4096];
+    int rlen = hid_get_report_descriptor(g_hid_handle, rdesc, sizeof(rdesc));
+    if (rlen < 0) rlen = 0;
+
     char *pname = json_escape(g_hid_product_string ? g_hid_product_string : "Unknown");
-    char resp[512];
-    snprintf(resp, sizeof(resp),
-        "{\"type\":\"opened\",\"vendorId\":%d,\"productId\":%d,\"productName\":%s}",
-        vendor_id, product_id, pname ? pname : "\"Unknown\"");
+    char *pserial = json_escape(serial_str);
+    /* base fields + room for the descriptor array (up to ~6 chars/byte) */
+    size_t cap = 1024 + (size_t)rlen * 6;
+    char *resp = malloc(cap);
+    if (!resp) {
+        free(pname);
+        free(pserial);
+        send_json_text(wsi, "{\"type\":\"error\",\"message\":\"Out of memory\"}");
+        return;
+    }
+    int off = snprintf(resp, cap,
+        "{\"type\":\"opened\",\"vendorId\":%d,\"productId\":%d,\"productName\":%s"
+        ",\"usagePage\":%u,\"usage\":%u,\"interfaceNumber\":%d,\"busType\":%d,"
+        "\"releaseNumber\":%u,\"serialNumber\":%s,\"reportDescriptor\":[",
+        vendor_id, product_id, pname ? pname : "\"Unknown\"",
+        usage_page, usage, interface_number, bus_type, release_number,
+        pserial ? pserial : "\"\"");
     free(pname);
+    free(pserial);
+    for (int k = 0; k < rlen; k++) {
+        off += snprintf(resp + off, cap - (size_t)off, "%s%d", k ? "," : "", rdesc[k]);
+    }
+    snprintf(resp + off, cap - (size_t)off, "]}");
     send_json_text(wsi, resp);
+    free(resp);
 }
 
 static void cmd_send_report(int report_id, const uint8_t *data, int datalen) {
