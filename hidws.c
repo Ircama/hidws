@@ -1,5 +1,5 @@
 /*
- * hidws v1.2.1 — WebSocket ↔ HID bridge
+ * hidws v1.2.2 — WebSocket ↔ HID bridge
  *
  * Uses libwebsockets for WebSocket server, hidapi (libusb) for HID access.
  *
@@ -37,7 +37,7 @@
 #include <libwebsockets.h>
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.1"
+#define HIDWS_VERSION "1.2.2"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
