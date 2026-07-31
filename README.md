@@ -57,6 +57,13 @@ sudo make install          # PREFIX=/usr/local
 
 This builds both `hidws` and `hid-list`.
 
+> **MIPS/uClibc note (v1.2.1):** on the freetz MIPS toolchain (GCC 13.4.0,
+> uClibc-ng, `-march=34kc -msoft-float`), compiling `hidws` with `-O1` or
+> higher miscompiles the reader thread and crashes with a NULL deref inside
+> `hid_read_timeout` (only `-O0` is stable there). On other platforms the
+> default flags are fine. If you hit a `Segmentation fault` right after
+> `[hid] Reader thread started`, rebuild with `-O0`.
+
 ## Usage
 
 ### hidws - WebSocket <-> HID bridge

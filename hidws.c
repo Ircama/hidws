@@ -1,5 +1,5 @@
 /*
- * hidws v1.2.0 — WebSocket ↔ HID bridge
+ * hidws v1.2.1 — WebSocket ↔ HID bridge
  *
  * Uses libwebsockets for WebSocket server, hidapi (libusb) for HID access.
  *
@@ -37,7 +37,7 @@
 #include <libwebsockets.h>
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.0"
+#define HIDWS_VERSION "1.2.1"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -56,11 +56,11 @@ struct per_session_data {
 };
 
 /* ──────────────────── HID device state ──────────────────────────────── */
-static hid_device *g_hid_handle = NULL;
+static hid_device *volatile g_hid_handle = NULL;
 static int g_hid_vendor_id = 0;
 static int g_hid_product_id = 0;
 static char *g_hid_product_string = NULL;
-static bool g_hid_open = false;
+static volatile bool g_hid_open = false;
 static pthread_mutex_t g_hid_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t g_hid_thread = (pthread_t)0;
@@ -191,37 +191,10 @@ static void cmd_open(struct lws *wsi, int vendor_id, int product_id) {
         return;
     }
 
-    g_hid_handle = hid_open(vendor_id, product_id, NULL);
-    if (!g_hid_handle) {
-        send_json_text(wsi, "{\"type\":\"error\",\"message\":\"Device not found or permission denied\"}");
-        return;
-    }
-
-    g_hid_vendor_id = vendor_id;
-    g_hid_product_id = product_id;
-
-    wchar_t wstr[256];
-    free(g_hid_product_string);
-    g_hid_product_string = NULL;
-    if (hid_get_product_string(g_hid_handle, wstr, sizeof(wstr)/2) == 0) {
-        size_t needed = wcslen(wstr) * 4 + 1;
-        g_hid_product_string = malloc(needed);
-        if (g_hid_product_string)
-            wcstombs(g_hid_product_string, wstr, needed - 1);
-    } else {
-        g_hid_product_string = strdup("Unknown");
-    }
-    g_hid_open = true;
-
-    if (!g_hid_thread_running) {
-        g_hid_thread_running = true;
-        if (pthread_create(&g_hid_thread, NULL, hid_read_worker, NULL) != 0) {
-            fprintf(stderr, "[hid] Failed to create reader thread\n");
-            g_hid_thread_running = false;
-        }
-    }
-
-    /* Gather extra device info from enumeration (usage, interface, bus, ...) */
+    /* Collect device info from enumeration first, while nothing is open yet.
+     * hidapi's libusb backend starts an internal read thread on the first
+     * hid_read_timeout() call, so every other hidapi call MUST happen before
+     * the reader thread is started, otherwise it races with that thread. */
     unsigned short usage_page = 0, usage = 0, release_number = 0;
     int interface_number = -1, bus_type = -1;
     char serial_str[128] = "";
@@ -243,10 +216,41 @@ static void cmd_open(struct lws *wsi, int vendor_id, int product_id) {
     }
     if (devs) hid_free_enumeration(devs);
 
-    /* Fetch the raw HID report descriptor so clients can render collections */
+    g_hid_handle = hid_open(vendor_id, product_id, NULL);
+    if (!g_hid_handle) {
+        send_json_text(wsi, "{\"type\":\"error\",\"message\":\"Device not found or permission denied\"}");
+        return;
+    }
+
+    g_hid_vendor_id = vendor_id;
+    g_hid_product_id = product_id;
+
+    wchar_t wstr[256];
+    free(g_hid_product_string);
+    g_hid_product_string = NULL;
+    if (hid_get_product_string(g_hid_handle, wstr, sizeof(wstr)/2) == 0) {
+        size_t needed = wcslen(wstr) * 4 + 1;
+        g_hid_product_string = malloc(needed);
+        if (g_hid_product_string)
+            wcstombs(g_hid_product_string, wstr, needed - 1);
+    } else {
+        g_hid_product_string = strdup("Unknown");
+    }
+
+    /* Fetch the raw HID report descriptor while still single-threaded. */
     unsigned char rdesc[4096];
     int rlen = hid_get_report_descriptor(g_hid_handle, rdesc, sizeof(rdesc));
     if (rlen < 0) rlen = 0;
+
+    /* All hidapi setup done: now it is safe to start the reader thread. */
+    g_hid_open = true;
+    if (!g_hid_thread_running) {
+        g_hid_thread_running = true;
+        if (pthread_create(&g_hid_thread, NULL, hid_read_worker, NULL) != 0) {
+            fprintf(stderr, "[hid] Failed to create reader thread\n");
+            g_hid_thread_running = false;
+        }
+    }
 
     char *pname = json_escape(g_hid_product_string ? g_hid_product_string : "Unknown");
     char *pserial = json_escape(serial_str);
