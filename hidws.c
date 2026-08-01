@@ -1,5 +1,5 @@
 /*
- * hidws v1.2.2 — WebSocket ↔ HID bridge
+ * hidws v1.2.3 — WebSocket ↔ HID bridge
  *
  * Uses libwebsockets for WebSocket server, hidapi (libusb) for HID access.
  *
@@ -33,11 +33,14 @@
 #include <pthread.h>
 #include <stdarg.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+
 #include <hidapi/hidapi.h>
 #include <libwebsockets.h>
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.2"
+#define HIDWS_VERSION "1.2.3"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -528,6 +531,23 @@ static void sigint_handler(int sig) {
 
 /* ──────────────────── Entry point ───────────────────────────────────── */
 
+/* Return 1 if the given TCP port is already bound by another process. */
+static int port_in_use(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return 0;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    int rc = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+    return rc != 0 && errno == EADDRINUSE;
+}
+
 int main(int argc, char **argv) {
     int port = PORT_DEFAULT;
     if (argc >= 2) {
@@ -555,6 +575,16 @@ int main(int argc, char **argv) {
     info.gid = -1;
     info.uid = -1;
     info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+
+    if (port_in_use(port)) {
+        fprintf(stderr, "\n[server] ERROR: port %d is already in use.\n"
+                        "         Another hidws instance may still be running.\n"
+                        "         Stop it first, or start hidws on another port:\n"
+                        "           %s <port>\n\n",
+                port, argv[0]);
+        hid_exit();
+        return 1;
+    }
 
     g_context = lws_create_context(&info);
     if (!g_context) {
