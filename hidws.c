@@ -1,5 +1,5 @@
 /*
- * hidws v1.2.3 — WebSocket ↔ HID bridge
+ * hidws v1.2.4 — WebSocket ↔ HID bridge
  *
  * Uses libwebsockets for WebSocket server, hidapi (libusb) for HID access.
  *
@@ -40,7 +40,7 @@
 #include <libwebsockets.h>
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.3"
+#define HIDWS_VERSION "1.2.4"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -429,7 +429,17 @@ static void *hid_read_worker(void *arg) {
             continue;
         }
         int n = hid_read_timeout(g_hid_handle, buf, sizeof(buf), 100);
-        if (n < 0) { fprintf(stderr, "[hid] Read error\n"); break; }
+        if (n < 0) {
+            /* Transient USB error (e.g. device briefly unresponsive). Do NOT
+             * exit here: if the reader dies, g_hid_thread_running would stay
+             * true forever, so a later open() would never respawn it and the
+             * backend would silently stop forwarding input reports. Keep
+             * polling (gated by g_hid_open / g_hid_thread_running below). */
+            fprintf(stderr, "[hid] Read error, retrying\n");
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
         if (n == 0) continue;
         int report_id = (n > 0) ? buf[0] : 0;
         char *bstr = json_bytes(buf, n);
@@ -440,6 +450,11 @@ static void *hid_read_worker(void *arg) {
             free(bstr);
         }
     }
+    /* Reader exiting: reset the thread flags so a later open() can spawn a
+     * fresh reader thread, instead of leaving the backend permanently unable
+     * to forward input reports until the process is restarted. */
+    g_hid_thread_running = false;
+    g_hid_thread = (pthread_t)0;
     fprintf(stderr, "[hid] Reader thread stopped\n");
     return NULL;
 }

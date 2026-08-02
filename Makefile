@@ -5,23 +5,38 @@
 #   make
 #
 # Builds:
-#   hidws     - WebSocket <-> HID bridge daemon (libwebsockets + hidapi-libusb)
-#   hid-list  - enumerate USB HID devices and probe their reports (hidapi-libusb)
+#   hidws     - WebSocket <-> HID bridge daemon (libwebsockets + hidapi)
+#   hid-list  - enumerate USB HID devices and probe their reports (hidapi)
 #
-# Both binaries use the hidapi libusb backend and do not require kernel
-# HID/INPUT support.
+# hidapi backend selection (BACKEND=libusb is the default):
+#   make BACKEND=libusb   -> hidapi-libusb  (raw USB interrupt transfers;
+#                            no kernel HID/INPUT support needed)
+#   make BACKEND=hidraw   -> hidapi-hidraw  (talks to the kernel's /dev/hidraw
+#                            node; the SAME path WebHID uses on Linux).
+#
+# Note: if a device answers WebHID (hidraw) but NOT libusb, rebuild with
+#       BACKEND=hidraw to match WebHID's transport.
+
+BACKEND ?= libusb
+
+HIDAPI_PKG := hidapi-$(BACKEND)
+ifeq ($(BACKEND),hidraw)
+HIDAPI_LDLIBS := -lhidapi-hidraw
+else
+HIDAPI_LDLIBS := -lhidapi-libusb
+endif
 
 CC ?= gcc
 
 CFLAGS ?= -Wall -Wextra -O2 -pthread -MMD -MP
-LDLIBS_HIDWS   ?= -lhidapi-libusb -lwebsockets -lpthread
-LDLIBS_HIDLIST ?= -lhidapi-libusb
+LDLIBS_HIDWS   ?= $(HIDAPI_LDLIBS) -lwebsockets -lpthread
+LDLIBS_HIDLIST ?= $(HIDAPI_LDLIBS)
 
 PREFIX ?= /usr/local
 
-PKG_CFLAGS := $(shell pkg-config --cflags hidapi-libusb libwebsockets 2>/dev/null)
-PKG_LIBS_HIDWS   := $(shell pkg-config --libs hidapi-libusb libwebsockets 2>/dev/null)
-PKG_LIBS_HIDLIST := $(shell pkg-config --libs hidapi-libusb 2>/dev/null)
+PKG_CFLAGS := $(shell pkg-config --cflags $(HIDAPI_PKG) libwebsockets 2>/dev/null)
+PKG_LIBS_HIDWS   := $(shell pkg-config --libs $(HIDAPI_PKG) libwebsockets 2>/dev/null)
+PKG_LIBS_HIDLIST := $(shell pkg-config --libs $(HIDAPI_PKG) 2>/dev/null)
 
 TARGETS = hidws hid-list
 
