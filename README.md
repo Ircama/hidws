@@ -93,6 +93,19 @@ encrypted `wss://` on the **same port**:
 > must be told to accept it (a one-time warning) or the app must be configured
 > to allow self-signed certificates.
 
+### Diagnostic page (http/https on the same port)
+
+Opening `http://<host>:<port>/` or `https://<host>:<port>/` in a browser
+serves a small **diagnostic page** that confirms the daemon is reachable and
+shows version, port and the available WebSocket endpoints, plus **"Test ws://"
+/ "Test wss://"** buttons that open a real WebSocket to the server and report
+success/failure.
+
+This is the convenient way to confirm access and (for `wss://`) to accept the
+browser's one-time security exception for the self-signed certificate: visit
+`https://192.168.178.1:9001/`, accept the warning, then reload the page and
+press "Test wss://".
+
 ### hid-list - enumerate HID devices
 
 ```bash

@@ -56,7 +56,7 @@
 #endif
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.5"
+#define HIDWS_VERSION "1.2.6"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -72,6 +72,9 @@
 /* ──────────────────── Per-connection user data ──────────────────────── */
 struct per_session_data {
     bool opened;
+    /* Buffer for the HTTP diagnostic page served to plain browser hits. */
+    char http_body[8192];
+    size_t http_body_len;
 };
 
 /* ──────────────────── HID device state ──────────────────────────────── */
@@ -88,6 +91,9 @@ static volatile bool g_hid_thread_running = false;
 /* ──────────────────── Global state ──────────────────────────────────── */
 static struct lws_context *g_context = NULL;
 static volatile bool g_running = true;
+
+static int g_port = PORT_DEFAULT;
+static bool g_ssl_enabled = false;
 
 static pthread_mutex_t g_bcast_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *g_bcast_msg = NULL;
@@ -477,6 +483,8 @@ static void *hid_read_worker(void *arg) {
 
 /* ──────────────────── libwebsockets protocol callback ────────────────── */
 
+static size_t build_http_page(char *buf, size_t cap);
+
 static int hidws_callback(struct lws *wsi, enum lws_callback_reasons reason,
                          void *user, void *in, size_t len)
 {
@@ -529,6 +537,39 @@ static int hidws_callback(struct lws *wsi, enum lws_callback_reasons reason,
         pthread_mutex_unlock(&g_bcast_lock);
         break;
 
+    /* A browser hit the server with a plain HTTP(S) GET (no WebSocket
+     * upgrade): serve the diagnostic page. lws routes HTTP requests with no
+     * mount match to protocols[0], which is this "hidws" protocol. */
+    case LWS_CALLBACK_HTTP:
+        psd->http_body_len = build_http_page(psd->http_body,
+                                             sizeof(psd->http_body));
+        {
+            unsigned char hdr[LWS_PRE + 512];
+            unsigned char *start = hdr + LWS_PRE;
+            unsigned char *p = start;
+            unsigned char *end = hdr + sizeof(hdr);
+            if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK,
+                        "text/html; charset=utf-8",
+                        (lws_filepos_t)psd->http_body_len, &p, end))
+                return 1;
+            if (lws_finalize_write_http_header(wsi, start, &p, end))
+                return 1;
+        }
+        lws_callback_on_writable(wsi);
+        break;
+
+    case LWS_CALLBACK_HTTP_WRITEABLE:
+        if (psd->http_body_len) {
+            if (lws_write(wsi, (unsigned char *)psd->http_body,
+                          psd->http_body_len, LWS_WRITE_HTTP) !=
+                          (int)psd->http_body_len)
+                return 1;
+            psd->http_body_len = 0;
+        }
+        if (lws_http_transaction_completed(wsi))
+            return -1;
+        break;
+
     case LWS_CALLBACK_EVENT_WAIT_CANCELLED:
         lws_callback_on_writable_all_protocol(lws_get_context(wsi),
             lws_get_protocol(wsi));
@@ -538,6 +579,76 @@ static int hidws_callback(struct lws *wsi, enum lws_callback_reasons reason,
         break;
     }
     return 0;
+}
+
+/* ──────────────────── HTTP diagnostic page ──────────────────────────── */
+
+static size_t build_http_page(char *buf, size_t cap) {
+    const char *endpoints = g_ssl_enabled
+        ? "ws:// and wss:// (same port)"
+        : "ws:// (plain)";
+    int n = snprintf(buf, cap,
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>hidws &mdash; diagnostic</title>"
+        "<style>"
+        "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "margin:0;background:#0f172a;color:#e2e8f0;min-height:100vh;"
+        "display:flex;align-items:center;justify-content:center}"
+        ".card{max-width:640px;margin:24px;padding:32px;background:#1e293b;"
+        "border:1px solid #334155;border-radius:16px;width:100%%}"
+        "h1{margin:0 0 4px;font-size:24px}.sub{color:#94a3b8;margin-bottom:16px}"
+        "table{width:100%%;border-collapse:collapse;margin:14px 0}"
+        "td{padding:6px 8px;border-bottom:1px solid #334155;font-size:14px;"
+        "vertical-align:top}td:first-child{color:#94a3b8;width:130px}"
+        "code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:13px}"
+        "button{margin:6px 8px 0 0;padding:10px 16px;border:0;border-radius:8px;"
+        "background:#3b82f6;color:#fff;font-size:14px;cursor:pointer}"
+        "button.green{background:#22c55e}"
+        "#result{margin-top:14px;padding:10px 12px;border-radius:8px;"
+        "font-size:14px;white-space:pre-wrap}"
+        ".ok{background:#052e16;color:#86efac}.bad{background:#450a0a;color:#fca5a5}"
+        "a{color:#60a5fa}</style></head><body><div class=\"card\">"
+        "<h1>hidws v%s</h1>"
+        "<div class=\"sub\">WebSocket &harr; USB HID gateway &mdash; server running</div>"
+        "<table>"
+        "<tr><td>Status</td><td><b style=\"color:#4ade80\">&#9679; running</b></td></tr>"
+        "<tr><td>Version</td><td>%s</td></tr>"
+        "<tr><td>Port</td><td>%d</td></tr>"
+        "<tr><td>Endpoints</td><td>%s</td></tr>"
+        "<tr><td>Protocol</td><td>JSON over WebSocket: "
+        "<code>{\"cmd\":\"list\"}</code>, <code>open</code>, "
+        "<code>send_report</code> ...</td></tr>"
+        "</table>"
+        "<p>Connect your web app to a WebSocket endpoint above. If you use "
+        "<b>wss://</b>, the browser shows a one-time security warning for the "
+        "self-signed certificate: click <i>Advanced &rarr; Proceed / Accept "
+        "the Risk</i> (or open <code>https://&lt;host&gt;:%d/</code> once and "
+        "accept the exception), then reconnect.</p>"
+        "<button class=\"green\" onclick=\"testWs('ws')\">Test ws://</button>"
+        "<button onclick=\"testWs('wss')\">Test wss://</button>"
+        "<div id=\"result\"></div></div>"
+        "<script>"
+        "function testWs(s){"
+        "var o=document.getElementById('result');"
+        "var u=s+'://'+location.host+'/';"
+        "o.className='';o.textContent='Connecting to '+u+' ...';"
+        "var w;"
+        "try{w=new WebSocket(u);}catch(e){o.className='bad';"
+        "o.textContent='Error: '+e.message;return;}"
+        "w.onopen=function(){o.className='ok';"
+        "o.textContent=s+':// CONNECTED';w.close();};"
+        "w.onerror=function(){o.className='bad';"
+        "o.textContent=s+':// FAILED \\u2014 certificate not trusted or "
+        "connection refused';};"
+        "}"
+        "</script></body></html>",
+        HIDWS_VERSION, HIDWS_VERSION, g_port, endpoints, g_port);
+    if (n < 0)
+        return 0;
+    /* snprintf returns the would-be length, which can exceed cap: clamp it
+     * to what actually fits (leaving room for the NUL terminator). */
+    return (size_t)(n < (int)cap ? n : (int)cap - 1);
 }
 
 /* ──────────────────── Protocol list ──────────────────────────────────── */
@@ -703,6 +814,9 @@ int main(int argc, char **argv) {
                  base, sslc.cert_path);
     }
 
+    g_port = port;
+    g_ssl_enabled = sslc.enabled;
+
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
@@ -719,6 +833,11 @@ int main(int argc, char **argv) {
     info.protocols = protocols;
     info.gid = -1;
     info.uid = -1;
+    /* This is a WebSocket (RFC 6455) server: browsers use HTTP/1.1 for the
+     * WS upgrade, and the diagnostic page is trivial. Force HTTP/1.1 via
+     * ALPN so clients don't negotiate HTTP/2, which lws's h2 handling does
+     * not need here and which crashes this build after serving the page. */
+    info.alpn = "http/1.1";
     info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
     if (sslc.enabled) {
