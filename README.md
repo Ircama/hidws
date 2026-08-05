@@ -72,18 +72,26 @@ The HID device is released automatically when the client disconnects.
 
 ### TLS / WSS support (same port as WS)
 
-Pass `--cert` (and optionally `--key`) to serve **both** plain `ws://` and
-encrypted `wss://` on the **same port**:
+By default (`./hidws [port]`) hidws serves **both** plain `ws://` and
+encrypted `wss://` on the **same port**, using a **temporary self-signed
+certificate kept only in memory** (no file, no disk writes, regenerated on
+every start). A warning is printed to the log and shown on the diagnostic
+page.
 
 ```bash
-./hidws 9001 --cert /etc/hidws/server.crt --key /etc/hidws/server.key
+./hidws 9001                      # ws:// + wss://, temporary in-memory cert
+./hidws 9001 --no-ssl             # ws:// only (no TLS at all)
+./hidws 9001 --cert server.crt --key server.key   # persistent cert
 ```
 
-- `--key` is optional: if omitted, it is derived from the cert path by
-  replacing the extension with `.key` (`server.crt` -> `server.key`).
-- If the certificate file does not exist yet and hidws was built with SSL
-  support, a **self-signed** certificate/key pair is generated automatically
-  at first start (RSA-2048, valid 10 years, CN/SAN `fritz.box`).
+- `--cert FILE [--key FILE]`: use a **persistent** certificate. If the cert
+  file does not exist yet and hidws was built with SSL support, a
+  **self-signed** certificate/key pair is generated automatically at first
+  start (RSA-2048, valid 10 years, CN/SAN `fritz.box`). `--key` is optional:
+  if omitted, it is derived from the cert path by replacing the extension
+  with `.key` (`server.crt` -> `server.key`).
+- `--no-ssl`: force plain `ws://` only (no TLS). Useful to keep an explicit
+  "no TLS" mode, e.g. from an init script.
 - Both schemes are served by the same listening socket, so
   `ws://192.168.178.1:9001` **and** `wss://192.168.178.1:9001` work side by
   side. This is handy on HTTPS-hosted web apps (e.g. GitHub Pages) which block
@@ -91,7 +99,9 @@ encrypted `wss://` on the **same port**:
 
 > Note: the self-signed certificate is not trusted by clients, so browsers
 > must be told to accept it (a one-time warning) or the app must be configured
-> to allow self-signed certificates.
+> to allow self-signed certificates. With a **temporary** in-memory cert the
+> exception is re-asked on every service restart; with a **persistent** cert
+> (`--cert`) the exception stays valid across restarts.
 
 ### Diagnostic page (http/https on the same port)
 
@@ -99,7 +109,8 @@ Opening `http://<host>:<port>/` or `https://<host>:<port>/` in a browser
 serves a small **diagnostic page** that confirms the daemon is reachable and
 shows version, port and the available WebSocket endpoints, plus **"Test ws://"
 / "Test wss://"** buttons that open a real WebSocket to the server and report
-success/failure.
+success/failure. When a temporary in-memory certificate is in use, the page
+shows a warning banner about it.
 
 This is the convenient way to confirm access and (for `wss://`) to accept the
 browser's one-time security exception for the self-signed certificate: visit

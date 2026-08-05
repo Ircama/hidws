@@ -56,7 +56,7 @@
 #endif
 
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.6"
+#define HIDWS_VERSION "1.2.7"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -94,6 +94,14 @@ static volatile bool g_running = true;
 
 static int g_port = PORT_DEFAULT;
 static bool g_ssl_enabled = false;
+/* True when no --cert was given and a temporary in-memory self-signed
+ * certificate is used (regenerated on every start). */
+static bool g_cert_temporary = false;
+
+#ifdef HIDWS_SSL
+static char *g_mem_cert = NULL;
+static char *g_mem_key = NULL;
+#endif
 
 static pthread_mutex_t g_bcast_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *g_bcast_msg = NULL;
@@ -587,6 +595,14 @@ static size_t build_http_page(char *buf, size_t cap) {
     const char *endpoints = g_ssl_enabled
         ? "ws:// and wss:// (same port)"
         : "ws:// (plain)";
+    const char *cert_warn = g_cert_temporary
+        ? "<p style=\"margin-top:14px;padding:10px 12px;border-radius:8px;"
+          "background:#78350f;color:#fbbf24\">&#9888; TEMPORARY self-signed "
+          "certificate (kept in memory, regenerated on every start) \\u2014 "
+          "browsers will re-ask the security exception after each service "
+          "restart. For a persistent certificate pass "
+          "<code>--cert FILE</code> on the command line.</p>"
+        : "";
     int n = snprintf(buf, cap,
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -625,6 +641,7 @@ static size_t build_http_page(char *buf, size_t cap) {
         "self-signed certificate: click <i>Advanced &rarr; Proceed / Accept "
         "the Risk</i> (or open <code>https://&lt;host&gt;:%d/</code> once and "
         "accept the exception), then reconnect.</p>"
+        "%s"
         "<button class=\"green\" onclick=\"testWs('ws')\">Test ws://</button>"
         "<button onclick=\"testWs('wss')\">Test wss://</button>"
         "<div id=\"result\"></div></div>"
@@ -643,7 +660,7 @@ static size_t build_http_page(char *buf, size_t cap) {
         "connection refused';};"
         "}"
         "</script></body></html>",
-        HIDWS_VERSION, HIDWS_VERSION, g_port, endpoints, g_port);
+        HIDWS_VERSION, HIDWS_VERSION, g_port, endpoints, g_port, cert_warn);
     if (n < 0)
         return 0;
     /* snprintf returns the would-be length, which can exceed cap: clamp it
@@ -680,19 +697,21 @@ struct ssl_config {
 };
 
 #ifdef HIDWS_SSL
-/* Generate a self-signed RSA-2048 X.509 certificate (PEM) and its private
- * key at the given paths. Used automatically when --cert points to a file
- * that does not exist yet, so wss:// works out of the box on a fresh
- * install without needing the openssl command-line tool on the device. */
-static int generate_self_signed_cert(const char *cert_path, const char *key_path) {
+
+/* Core: create a self-signed RSA-2048 X.509 certificate (CN/SAN fritz.box,
+ * valid 10 years). On success *pkey and *x509 are set (caller frees).
+ * Returns 0 on success. */
+static int create_self_signed(EVP_PKEY **pkey_out, X509 **x509_out) {
     EVP_PKEY_CTX *pctx = NULL;
     EVP_PKEY *pkey = NULL;
     X509 *x509 = NULL;
     X509V3_CTX v3ctx;
     X509_EXTENSION *ext = NULL;
     BIGNUM *bn = NULL;
-    FILE *f = NULL;
     int ok = 0;
+
+    *pkey_out = NULL;
+    *x509_out = NULL;
 
     /* 1. RSA-2048 key pair */
     pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
@@ -731,6 +750,30 @@ static int generate_self_signed_cert(const char *cert_path, const char *key_path
 
     if (!X509_sign(x509, pkey, EVP_sha256())) goto done;
 
+    *pkey_out = pkey;
+    *x509_out = x509;
+    ok = 1;
+
+done:
+    if (!ok) {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+    }
+    BN_free(bn);
+    EVP_PKEY_CTX_free(pctx);
+    return ok;
+}
+
+/* Write a self-signed certificate/key to PEM files (persistent --cert use). */
+static int generate_self_signed_cert(const char *cert_path, const char *key_path) {
+    EVP_PKEY *pkey = NULL;
+    X509 *x509 = NULL;
+    FILE *f = NULL;
+    int ok = 0;
+
+    if (!create_self_signed(&pkey, &x509))
+        return 0;
+
     /* 3. Write private key (0600) then certificate */
     f = fopen(key_path, "wb");
     if (!f) goto done;
@@ -749,8 +792,55 @@ static int generate_self_signed_cert(const char *cert_path, const char *key_path
 
 done:
     if (f) fclose(f);
-    BN_free(bn);
-    EVP_PKEY_CTX_free(pctx);
+    EVP_PKEY_free(pkey);
+    X509_free(x509);
+    return ok;
+}
+
+/* Generate a self-signed certificate/key into memory (no file on disk).
+ * *cert_out and *key_out are malloc'd NUL-terminated PEM strings. */
+static int generate_self_signed_cert_mem(char **cert_out, char **key_out) {
+    EVP_PKEY *pkey = NULL;
+    X509 *x509 = NULL;
+    BIO *bio = NULL;
+    BUF_MEM *bptr = NULL;
+    int ok = 0;
+
+    *cert_out = NULL;
+    *key_out = NULL;
+
+    if (!create_self_signed(&pkey, &x509))
+        return 0;
+
+    /* private key PEM -> memory */
+    bio = BIO_new(BIO_s_mem());
+    if (!bio) goto done;
+    if (!PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL))
+        goto done;
+    BIO_get_mem_ptr(bio, &bptr);
+    *key_out = malloc(bptr->length + 1);
+    if (!*key_out) goto done;
+    memcpy(*key_out, bptr->data, bptr->length);
+    (*key_out)[bptr->length] = '\0';
+    BIO_free(bio);
+    bio = NULL;
+
+    /* certificate PEM -> memory */
+    bio = BIO_new(BIO_s_mem());
+    if (!bio) goto done;
+    if (!PEM_write_bio_X509(bio, x509)) goto done;
+    BIO_get_mem_ptr(bio, &bptr);
+    *cert_out = malloc(bptr->length + 1);
+    if (!*cert_out) goto done;
+    memcpy(*cert_out, bptr->data, bptr->length);
+    (*cert_out)[bptr->length] = '\0';
+    BIO_free(bio);
+    bio = NULL;
+
+    ok = 1;
+
+done:
+    if (bio) BIO_free(bio);
     EVP_PKEY_free(pkey);
     X509_free(x509);
     return ok;
@@ -780,22 +870,26 @@ int main(int argc, char **argv) {
     int port = PORT_DEFAULT;
     struct ssl_config sslc;
     memset(&sslc, 0, sizeof(sslc));
+    bool no_ssl = false;
 
-    /* Parse arguments: positional port plus --cert/--key options. */
+    /* Parse arguments: positional port plus --cert/--key/--no-ssl options. */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
             snprintf(sslc.cert_path, sizeof(sslc.cert_path), "%s", argv[++i]);
             sslc.enabled = true;
         } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
             snprintf(sslc.key_path, sizeof(sslc.key_path), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--no-ssl") == 0) {
+            no_ssl = true;
         } else if (argv[i][0] == '-' && argv[i][1] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
         } else {
             port = atoi(argv[i]);
             if (port <= 0 || port > 65535) {
-                fprintf(stderr, "Usage: %s [port] [--cert FILE] [--key FILE]\n",
-                        argv[0]);
+                fprintf(stderr,
+                    "Usage: %s [port] [--cert FILE] [--key FILE] [--no-ssl]\n",
+                    argv[0]);
                 return 1;
             }
         }
@@ -812,6 +906,20 @@ int main(int argc, char **argv) {
         if (base > max_base) base = max_base;
         snprintf(sslc.key_path, sizeof(sslc.key_path), "%.*s.key",
                  base, sslc.cert_path);
+    }
+
+    /* No certificate and no explicit --no-ssl: serve wss:// anyway using a
+     * TEMPORARY self-signed certificate kept only in memory (no file, no
+     * disk writes). For a persistent certificate (stable browser exception
+     * across restarts) pass --cert FILE. */
+    if (!sslc.enabled && !no_ssl) {
+#ifdef HIDWS_SSL
+        sslc.enabled = true;
+        g_cert_temporary = true;
+#else
+        /* Built without SSL support: stay plain ws://. */
+        sslc.enabled = false;
+#endif
     }
 
     g_port = port;
@@ -843,42 +951,83 @@ int main(int argc, char **argv) {
     if (sslc.enabled) {
         /* Serve both plain ws:// and encrypted wss:// on the same port.
          * In libwebsockets 4.x TLS is enabled automatically as soon as
-         * ssl_cert_filepath is set. ALLOW_NON_SSL_ON_SSL_PORT keeps a plain
-         * connection from being rejected for lacking a TLS ClientHello, and
+         * ssl_cert_filepath (or ssl_cert_mem) is set.
+         * ALLOW_NON_SSL_ON_SSL_PORT keeps a plain connection from being
+         * rejected for lacking a TLS ClientHello, and
          * ALLOW_HTTP_ON_HTTPS_LISTENER lets that plain connection actually
          * be served as a normal HTTP/WebSocket upgrade. */
         info.options |= LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT |
                         LWS_SERVER_OPTION_ALLOW_HTTP_ON_HTTPS_LISTENER;
-        info.ssl_cert_filepath = sslc.cert_path;
-        info.ssl_private_key_filepath = sslc.key_path;
 
-        if (access(sslc.cert_path, R_OK) != 0) {
+        if (g_cert_temporary) {
 #ifdef HIDWS_SSL
-            fprintf(stderr, "[ssl] Certificate %s not found, generating a "
-                            "self-signed one...\n", sslc.cert_path);
-            if (!generate_self_signed_cert(sslc.cert_path, sslc.key_path)) {
-                fprintf(stderr, "[ssl] ERROR: failed to generate self-signed "
-                                "certificate (check permissions of %s)\n",
-                        sslc.cert_path);
+            /* Temporary self-signed certificate, kept ONLY in memory (no
+             * file, no disk writes); regenerated on every start. */
+            if (!generate_self_signed_cert_mem(&g_mem_cert, &g_mem_key)) {
+                fprintf(stderr, "[ssl] ERROR: failed to generate temporary "
+                                "self-signed certificate\n");
                 hid_exit();
                 return 1;
             }
-            fprintf(stderr, "[ssl] Self-signed certificate generated:\n"
-                            "        cert: %s\n        key:  %s\n",
-                    sslc.cert_path, sslc.key_path);
+            info.server_ssl_cert_mem = g_mem_cert;
+            info.server_ssl_cert_mem_len = (int)strlen(g_mem_cert);
+            info.server_ssl_private_key_mem = g_mem_key;
+            info.server_ssl_private_key_mem_len = (int)strlen(g_mem_key);
+            fprintf(stderr, "[ssl] WARNING: using a TEMPORARY self-signed "
+                            "certificate (kept in memory, regenerated on "
+                            "every start).\n"
+                            "        Browsers will re-ask the security "
+                            "exception after each restart.\n"
+                            "        For a persistent certificate (stable "
+                            "exception) pass --cert FILE.\n");
 #else
-            fprintf(stderr, "[ssl] ERROR: TLS requested (%s) but hidws was "
-                            "built without SSL support. Rebuild with HIDWS_SSL.\n",
-                    sslc.cert_path);
+            fprintf(stderr, "[ssl] ERROR: TLS requested but hidws was built "
+                            "without SSL support. Rebuild with HIDWS_SSL.\n");
             hid_exit();
             return 1;
 #endif
-        } else if (access(sslc.key_path, R_OK) != 0) {
-            fprintf(stderr, "[ssl] ERROR: private key %s not found "
-                            "(pass --key or put the key next to the cert).\n",
-                    sslc.key_path);
-            hid_exit();
-            return 1;
+        } else {
+            info.ssl_cert_filepath = sslc.cert_path;
+            info.ssl_private_key_filepath = sslc.key_path;
+
+            if (access(sslc.cert_path, R_OK) != 0) {
+#ifdef HIDWS_SSL
+                fprintf(stderr, "[ssl] Certificate %s not found, generating a "
+                                "self-signed one...\n", sslc.cert_path);
+                /* Ensure the certificate directory exists. */
+                {
+                    char dir[512];
+                    snprintf(dir, sizeof(dir), "%s", sslc.cert_path);
+                    char *slash = strrchr(dir, '/');
+                    if (slash && slash != dir) {
+                        *slash = '\0';
+                        mkdir(dir, 0755);
+                    }
+                }
+                if (!generate_self_signed_cert(sslc.cert_path, sslc.key_path)) {
+                    fprintf(stderr, "[ssl] ERROR: failed to generate self-signed "
+                                    "certificate (check permissions of %s)\n",
+                            sslc.cert_path);
+                    hid_exit();
+                    return 1;
+                }
+                fprintf(stderr, "[ssl] Self-signed certificate generated:\n"
+                                "        cert: %s\n        key:  %s\n",
+                        sslc.cert_path, sslc.key_path);
+#else
+                fprintf(stderr, "[ssl] ERROR: TLS requested (%s) but hidws was "
+                                "built without SSL support. Rebuild with HIDWS_SSL.\n",
+                        sslc.cert_path);
+                hid_exit();
+                return 1;
+#endif
+            } else if (access(sslc.key_path, R_OK) != 0) {
+                fprintf(stderr, "[ssl] ERROR: private key %s not found "
+                                "(pass --key or put the key next to the cert).\n",
+                        sslc.key_path);
+                hid_exit();
+                return 1;
+            }
         }
     }
 
@@ -902,7 +1051,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (sslc.enabled)
+    if (g_cert_temporary)
+        fprintf(stderr, "[server] hidws v%s listening on 0.0.0.0:%d "
+                        "(ws:// and wss://, TEMPORARY self-signed cert)\n",
+                HIDWS_VERSION, port);
+    else if (sslc.enabled)
         fprintf(stderr, "[server] hidws v%s listening on 0.0.0.0:%d "
                         "(ws:// and wss://)\n", HIDWS_VERSION, port);
     else
