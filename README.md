@@ -64,10 +64,34 @@ This builds both `hidws` and `hid-list`.
 ### hidws - WebSocket/HID bridge
 
 ```bash
-./hidws [port]
+./hidws [port] [--cert FILE] [--key FILE]
 ```
 
-Default port is `9001`. Point your WebSocket client to `ws://<host>:9001`.  The HID device is released automatically when the client disconnects.
+Default port is `9001`. Point your WebSocket client to `ws://<host>:9001`.
+The HID device is released automatically when the client disconnects.
+
+### TLS / WSS support (same port as WS)
+
+Pass `--cert` (and optionally `--key`) to serve **both** plain `ws://` and
+encrypted `wss://` on the **same port**:
+
+```bash
+./hidws 9001 --cert /etc/hidws/server.crt --key /etc/hidws/server.key
+```
+
+- `--key` is optional: if omitted, it is derived from the cert path by
+  replacing the extension with `.key` (`server.crt` -> `server.key`).
+- If the certificate file does not exist yet and hidws was built with SSL
+  support, a **self-signed** certificate/key pair is generated automatically
+  at first start (RSA-2048, valid 10 years, CN/SAN `fritz.box`).
+- Both schemes are served by the same listening socket, so
+  `ws://192.168.178.1:9001` **and** `wss://192.168.178.1:9001` work side by
+  side. This is handy on HTTPS-hosted web apps (e.g. GitHub Pages) which block
+  plain `ws://` connections: the app can fall back to `wss://`.
+
+> Note: the self-signed certificate is not trusted by clients, so browsers
+> must be told to accept it (a one-time warning) or the app must be configured
+> to allow self-signed certificates.
 
 ### hid-list - enumerate HID devices
 

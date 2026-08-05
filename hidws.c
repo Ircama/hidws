@@ -1,9 +1,14 @@
 /*
- * hidws v1.2.4 — WebSocket ↔ HID bridge
+ * hidws v1.2.5 — WebSocket ↔ HID bridge
  *
  * Uses libwebsockets for WebSocket server, hidapi (libusb) for HID access.
  *
- * Run:    ./hidws [port]       (default: 9001)
+ * Run:    ./hidws [port] [--cert FILE] [--key FILE]   (default: 9001)
+ *
+ * TLS/WSS: pass --cert (and optionally --key) to serve BOTH plain ws:// and
+ * encrypted wss:// on the same port. If the certificate file does not exist
+ * yet and the binary was built with SSL support (HIDWS_SSL), a self-signed
+ * certificate is generated automatically at first start.
  *
  * Wire protocol (JSON over WebSocket):
  *   Client → Server:  {"cmd":"list"}
@@ -39,8 +44,19 @@
 #include <hidapi/hidapi.h>
 #include <libwebsockets.h>
 
+/* OpenSSL is only needed to auto-generate a self-signed certificate.
+ * Define HIDWS_SSL at build time when linking against libssl/libcrypto. */
+#ifdef HIDWS_SSL
+#include <sys/stat.h>
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#endif
+
 /* ──────────────────────────── Version ──────────────────────────────── */
-#define HIDWS_VERSION "1.2.4"
+#define HIDWS_VERSION "1.2.5"
 
 /* ──────────────────────────── Configuration ──────────────────────────── */
 #ifndef PORT_DEFAULT
@@ -544,6 +560,92 @@ static void sigint_handler(int sig) {
     g_running = false;
 }
 
+/* ──────────────────── TLS / WSS support ────────────────────────────── */
+
+struct ssl_config {
+    bool enabled;
+    char cert_path[512];
+    char key_path[512];
+};
+
+#ifdef HIDWS_SSL
+/* Generate a self-signed RSA-2048 X.509 certificate (PEM) and its private
+ * key at the given paths. Used automatically when --cert points to a file
+ * that does not exist yet, so wss:// works out of the box on a fresh
+ * install without needing the openssl command-line tool on the device. */
+static int generate_self_signed_cert(const char *cert_path, const char *key_path) {
+    EVP_PKEY_CTX *pctx = NULL;
+    EVP_PKEY *pkey = NULL;
+    X509 *x509 = NULL;
+    X509V3_CTX v3ctx;
+    X509_EXTENSION *ext = NULL;
+    BIGNUM *bn = NULL;
+    FILE *f = NULL;
+    int ok = 0;
+
+    /* 1. RSA-2048 key pair */
+    pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!pctx) goto done;
+    if (EVP_PKEY_keygen_init(pctx) <= 0) goto done;
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) <= 0) goto done;
+    if (EVP_PKEY_keygen(pctx, &pkey) <= 0) goto done;
+
+    /* 2. Self-signed X.509 certificate, valid 10 years */
+    x509 = X509_new();
+    if (!x509) goto done;
+    X509_set_version(x509, 2);
+    bn = BN_new();
+    if (bn && BN_rand(bn, 64, 0, 0) == 1)
+        BN_to_ASN1_INTEGER(bn, X509_get_serialNumber(x509));
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), (long)10 * 365 * 24 * 3600);
+    X509_set_pubkey(x509, pkey);
+
+    {
+        X509_NAME *name = X509_get_subject_name(x509);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   (const unsigned char *)"fritz.box", -1, -1, 0);
+        X509_set_issuer_name(x509, name);
+    }
+
+    /* SAN so modern clients/browsers accept it for the local host */
+    X509V3_set_ctx(&v3ctx, x509, x509, NULL, NULL, 0);
+    ext = X509V3_EXT_conf_nid(NULL, &v3ctx, NID_subject_alt_name,
+        "DNS:fritz.box,DNS:localhost,IP:127.0.0.1,IP:192.168.178.1");
+    if (ext) {
+        X509_add_ext(x509, ext, -1);
+        X509_EXTENSION_free(ext);
+        ext = NULL;
+    }
+
+    if (!X509_sign(x509, pkey, EVP_sha256())) goto done;
+
+    /* 3. Write private key (0600) then certificate */
+    f = fopen(key_path, "wb");
+    if (!f) goto done;
+    if (!PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL)) goto done;
+    fclose(f);
+    f = NULL;
+    chmod(key_path, 0600);
+
+    f = fopen(cert_path, "wb");
+    if (!f) goto done;
+    if (!PEM_write_X509(f, x509)) goto done;
+    fclose(f);
+    f = NULL;
+
+    ok = 1;
+
+done:
+    if (f) fclose(f);
+    BN_free(bn);
+    EVP_PKEY_CTX_free(pctx);
+    EVP_PKEY_free(pkey);
+    X509_free(x509);
+    return ok;
+}
+#endif /* HIDWS_SSL */
+
 /* ──────────────────── Entry point ───────────────────────────────────── */
 
 /* Return 1 if the given TCP port is already bound by another process. */
@@ -565,12 +667,40 @@ static int port_in_use(int port) {
 
 int main(int argc, char **argv) {
     int port = PORT_DEFAULT;
-    if (argc >= 2) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "Usage: %s [port]\n", argv[0]);
+    struct ssl_config sslc;
+    memset(&sslc, 0, sizeof(sslc));
+
+    /* Parse arguments: positional port plus --cert/--key options. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
+            snprintf(sslc.cert_path, sizeof(sslc.cert_path), "%s", argv[++i]);
+            sslc.enabled = true;
+        } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
+            snprintf(sslc.key_path, sizeof(sslc.key_path), "%s", argv[++i]);
+        } else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
+        } else {
+            port = atoi(argv[i]);
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "Usage: %s [port] [--cert FILE] [--key FILE]\n",
+                        argv[0]);
+                return 1;
+            }
         }
+    }
+
+    /* Derive the key path from the cert path when --key is not given:
+     * /path/to/server.crt  ->  /path/to/server.key  */
+    if (sslc.enabled && sslc.key_path[0] == '\0') {
+        /* Leave room for the trailing ".key" (and NUL) in key_path. */
+        int max_base = (int)sizeof(sslc.key_path) - 8;
+        const char *dot = strrchr(sslc.cert_path, '.');
+        int base = dot ? (int)(dot - sslc.cert_path)
+                       : (int)strlen(sslc.cert_path);
+        if (base > max_base) base = max_base;
+        snprintf(sslc.key_path, sizeof(sslc.key_path), "%.*s.key",
+                 base, sslc.cert_path);
     }
 
     signal(SIGINT, sigint_handler);
@@ -591,6 +721,48 @@ int main(int argc, char **argv) {
     info.uid = -1;
     info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
+    if (sslc.enabled) {
+        /* Serve both plain ws:// and encrypted wss:// on the same port.
+         * In libwebsockets 4.x TLS is enabled automatically as soon as
+         * ssl_cert_filepath is set. ALLOW_NON_SSL_ON_SSL_PORT keeps a plain
+         * connection from being rejected for lacking a TLS ClientHello, and
+         * ALLOW_HTTP_ON_HTTPS_LISTENER lets that plain connection actually
+         * be served as a normal HTTP/WebSocket upgrade. */
+        info.options |= LWS_SERVER_OPTION_ALLOW_NON_SSL_ON_SSL_PORT |
+                        LWS_SERVER_OPTION_ALLOW_HTTP_ON_HTTPS_LISTENER;
+        info.ssl_cert_filepath = sslc.cert_path;
+        info.ssl_private_key_filepath = sslc.key_path;
+
+        if (access(sslc.cert_path, R_OK) != 0) {
+#ifdef HIDWS_SSL
+            fprintf(stderr, "[ssl] Certificate %s not found, generating a "
+                            "self-signed one...\n", sslc.cert_path);
+            if (!generate_self_signed_cert(sslc.cert_path, sslc.key_path)) {
+                fprintf(stderr, "[ssl] ERROR: failed to generate self-signed "
+                                "certificate (check permissions of %s)\n",
+                        sslc.cert_path);
+                hid_exit();
+                return 1;
+            }
+            fprintf(stderr, "[ssl] Self-signed certificate generated:\n"
+                            "        cert: %s\n        key:  %s\n",
+                    sslc.cert_path, sslc.key_path);
+#else
+            fprintf(stderr, "[ssl] ERROR: TLS requested (%s) but hidws was "
+                            "built without SSL support. Rebuild with HIDWS_SSL.\n",
+                    sslc.cert_path);
+            hid_exit();
+            return 1;
+#endif
+        } else if (access(sslc.key_path, R_OK) != 0) {
+            fprintf(stderr, "[ssl] ERROR: private key %s not found "
+                            "(pass --key or put the key next to the cert).\n",
+                    sslc.key_path);
+            hid_exit();
+            return 1;
+        }
+    }
+
     if (port_in_use(port)) {
         fprintf(stderr, "\n[server] ERROR: port %d is already in use.\n"
                         "         Another hidws instance may still be running.\n"
@@ -604,12 +776,19 @@ int main(int argc, char **argv) {
     g_context = lws_create_context(&info);
     if (!g_context) {
         fprintf(stderr, "[server] Failed to create libwebsockets context\n");
+        if (sslc.enabled)
+            fprintf(stderr, "[server] (TLS was requested; make sure the "
+                            "libwebsockets build has SSL support)\n");
         hid_exit();
         return 1;
     }
 
-    fprintf(stderr, "[server] hidws v%s listening on 0.0.0.0:%d\n",
-            HIDWS_VERSION, port);
+    if (sslc.enabled)
+        fprintf(stderr, "[server] hidws v%s listening on 0.0.0.0:%d "
+                        "(ws:// and wss://)\n", HIDWS_VERSION, port);
+    else
+        fprintf(stderr, "[server] hidws v%s listening on 0.0.0.0:%d "
+                        "(ws://)\n", HIDWS_VERSION, port);
 
     while (g_running && g_context)
         lws_service(g_context, 500);

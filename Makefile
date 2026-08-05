@@ -32,6 +32,14 @@ CFLAGS ?= -Wall -Wextra -O2 -pthread -MMD -MP
 LDLIBS_HIDWS   ?= $(HIDAPI_LDLIBS) -lwebsockets -lpthread
 LDLIBS_HIDLIST ?= $(HIDAPI_LDLIBS)
 
+# SSL/TLS (wss://) support: auto-enabled when OpenSSL dev files are present.
+# hidws then serves BOTH plain ws:// and encrypted wss:// on the same port.
+HAS_OPENSSL := $(shell pkg-config --exists openssl 2>/dev/null && echo 1)
+ifeq ($(HAS_OPENSSL),1)
+HIDWS_CFLAGS += -DHIDWS_SSL
+HIDWS_SSL_LIBS := $(shell pkg-config --libs openssl 2>/dev/null)
+endif
+
 PREFIX ?= /usr/local
 
 PKG_CFLAGS := $(shell pkg-config --cflags $(HIDAPI_PKG) libwebsockets 2>/dev/null)
@@ -43,7 +51,7 @@ TARGETS = hidws hid-list
 all: $(TARGETS)
 
 hidws: hidws.c
-	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o $@ $< $(if $(PKG_LIBS_HIDWS),$(PKG_LIBS_HIDWS),$(LDLIBS_HIDWS))
+	$(CC) $(CFLAGS) $(HIDWS_CFLAGS) $(PKG_CFLAGS) -o $@ $< $(if $(PKG_LIBS_HIDWS),$(PKG_LIBS_HIDWS),$(LDLIBS_HIDWS)) $(HIDWS_SSL_LIBS)
 
 hid-list: hid-list.c
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -o $@ $< $(if $(PKG_LIBS_HIDLIST),$(PKG_LIBS_HIDLIST),$(LDLIBS_HIDLIST))
